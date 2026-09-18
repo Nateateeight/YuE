@@ -56,6 +56,15 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, config["rms_norm_eps"])
         self.k_norm = RMSNorm(self.head_dim, config["rms_norm_eps"])
 
+    def project_qkv(self, x: mx.array, cos: mx.array, sin: mx.array):
+        B, T, _ = x.shape
+        q = self.q_norm(self.q_proj(x).reshape(B, T, self.num_heads, self.head_dim))
+        k = self.k_norm(self.k_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim))
+        v = self.v_proj(x).reshape(B, T, self.num_kv_heads, self.head_dim)
+        q = _apply_rotary(q, cos, sin)
+        k = _apply_rotary(k, cos, sin)
+        return q, k, v
+
     def __call__(self, x: mx.array, cos: mx.array, sin: mx.array,
                  cache: Optional[Tuple[mx.array, mx.array]] = None,
                  attention_mask: Optional[mx.array] = None,
@@ -121,13 +130,7 @@ class DecoderLayer(nn.Module):
         self.nar_mlp = MLP(config)
 
     def _project_qkv(self, attn: Attention, x: mx.array, cos: mx.array, sin: mx.array):
-        B, T, _ = x.shape
-        q = attn.q_norm(attn.q_proj(x).reshape(B, T, attn.num_heads, attn.head_dim))
-        k = attn.k_norm(attn.k_proj(x).reshape(B, T, attn.num_kv_heads, attn.head_dim))
-        v = attn.v_proj(x).reshape(B, T, attn.num_kv_heads, attn.head_dim)
-        q = _apply_rotary(q, cos, sin)
-        k = _apply_rotary(k, cos, sin)
-        return q, k, v
+        return attn.project_qkv(x, cos, sin)
 
     def __call__(self, x: mx.array, cos: mx.array, sin: mx.array,
                  ar_mask: Optional[mx.array] = None,
@@ -198,7 +201,6 @@ class TimestepEmbedder(nn.Module):
     def __call__(self, t: mx.array) -> mx.array:
         half = self.frequency_embedding_size // 2
         freqs = mx.exp(-math.log(10000) * mx.arange(half, dtype=mx.float32) / half)
-        # Handle both scalar and batched input
         if t.ndim == 0:
             t = t.reshape(1)
         args = t[:, None] * freqs[None, :]
@@ -220,14 +222,6 @@ class YuE2MLX(nn.Module):
         self.llm2vae = nn.Linear(config["hidden_size"], config["latent_dim"])
         self.vae2llm = nn.Linear(config["latent_dim"], config["hidden_size"])
         self.time_embed = TimestepEmbedder(config["hidden_size"])
-        # Latent position embedding (fixed, non-learnable)
-        max_frames = config.get("max_latent_frames", 24576)
-        pe = mx.zeros((max_frames, config["hidden_size"]))
-        pos = mx.arange(max_frames, dtype=mx.float32)[:, None]
-        div = mx.exp(mx.arange(0, config["hidden_size"], 2, dtype=mx.float32) * (-math.log(10000.0) / config["hidden_size"]))
-        pe[:, 0::2] = mx.sin(pos * div)
-        pe[:, 1::2] = mx.cos(pos * div)
-        self.latent_pos_embed = pe
 
     def forward_ar(self, input_ids: mx.array, position_ids: mx.array,
                    caches: Optional[List] = None, attention_mask: Optional[mx.array] = None,
@@ -247,68 +241,54 @@ class YuE2MLX(nn.Module):
 
     def forward_nar(self, input_ids: mx.array, position_ids: mx.array,
                     x_t: mx.array, t_value: float,
-                    ar_mask: Optional[mx.array] = None,
-                    caches: Optional[List] = None) -> mx.array:
-        """NAR forward pass for flow matching velocity prediction."""
+                    ar_mask: Optional[mx.array] = None) -> mx.array:
+        """NAR velocity prediction for flow matching."""
         B, S = input_ids.shape
         
-        # 1. Token embeddings for AR tokens
-        token_emb = self.embed_tokens(input_ids)  # [1, S, H]
+        # AR token embeddings
+        token_emb = self.embed_tokens(input_ids)
         
-        # 2. Build latent hidden for NAR positions
+        # Build latent hidden for NAR positions
         x_nar = mx.concatenate([mx.zeros((1, 64)), x_t, mx.zeros((1, 64))], axis=0)
-        
-        # Shift timestep
         t_shifted = self._shift_t_value(t_value)
         
-        # vae2llm(x_nar) + time_emb + pos_emb
-        nar_hidden = self.vae2llm(x_nar[None])  # [1, T_lat+2, H]
-        t_embed = self.time_embed(t_shifted)  # [1, H]
+        nar_hidden = self.vae2llm(x_nar[None])
+        t_embed = self.time_embed(t_shifted)
         nar_hidden = nar_hidden + t_embed[None, :, :]
         
-        # Position embedding (computed on the fly)
         nar_length = x_nar.shape[0]
         pe = self._compute_pe(nar_length)
         nar_hidden = nar_hidden + pe[None]
         
-        # For NAR positions, position ids shifted by AR length
         nar_pos_ids = mx.arange(S, S + nar_length, dtype=mx.int32)[None]
-        cos_nar, sin_nar = self.rotary(nar_pos_ids)
         
-        # Combine embeddings
-        full_emb = mx.concatenate([token_emb, nar_hidden], axis=1)  # [1, S + nar_length, H]
+        full_emb = mx.concatenate([token_emb, nar_hidden], axis=1)
         
-        # AR mask
         full_ar_mask = mx.concatenate([
             mx.ones((B, S), dtype=mx.bool_),
             mx.zeros((B, nar_length), dtype=mx.bool_)
         ], axis=1)
         
-        # Full position ids and RoPE
         full_pos_ids = mx.concatenate([position_ids, nar_pos_ids], axis=1)
         cos_full, sin_full = self.rotary(full_pos_ids)
         
-        # Hybrid attention mask
         attn_mask = self._hybrid_attention_mask(S, nar_length)
         
-        # Forward through decoder
         x = full_emb
         for i, layer in enumerate(self.layers):
             x, _ = layer(x, cos_full, sin_full, full_ar_mask, None, attn_mask, False)
         
         x = self.norm(x)
         
-        # Extract NAR content (skip START/END)
         nar_content_start = S + 1
         nar_content_end = S + nar_length - 1
         nar_out = x[:, nar_content_start:nar_content_end, :]
         
-        # Project to velocity
         v_pred = self.llm2vae(nar_out)
         return v_pred[0]
 
     def _compute_pe(self, length: int) -> mx.array:
-        """Compute sinusoidal position embeddings."""
+        """Compute sinusoidal position embeddings on the fly."""
         pe = mx.zeros((length, self.config["hidden_size"]))
         pos = mx.arange(length, dtype=mx.float32)[:, None]
         div = mx.exp(mx.arange(0, self.config["hidden_size"], 2, dtype=mx.float32) * 
@@ -318,39 +298,27 @@ class YuE2MLX(nn.Module):
         return pe
 
     def _shift_t_value(self, t_value: float) -> mx.array:
-        """Sigmoid shift for timestep."""
         t_sig = mx.sigmoid(mx.array(t_value, dtype=mx.float32))
         shift = self.config.get("timestep_shift", 1.0)
         result = shift * t_sig / (1 + (shift - 1) * t_sig)
-        return result.reshape(1)  # Always return [1] for consistency
+        return result.reshape(1)
 
     def _hybrid_attention_mask(self, ar_len: int, nar_len: int) -> mx.array:
-        """Build hybrid attention mask for AR+NAR sequence.
-        
-        AR→AR: causal, NAR→AR: full, NAR→NAR: bidirectional, AR→NAR: blocked
-        """
         S = ar_len + nar_len
         
         ar_q = mx.zeros((1, S), dtype=mx.float32)
         ar_q[:, :ar_len] = 1.0
-        
         ar_k = mx.zeros((1, S), dtype=mx.float32)
         ar_k[:, :ar_len] = 1.0
-        
         nar_q = mx.zeros((1, S), dtype=mx.float32)
         nar_q[:, ar_len:] = 1.0
-        
         nar_k = mx.zeros((1, S), dtype=mx.float32)
         nar_k[:, ar_len:] = 1.0
-        
         causal = mx.tril(mx.ones((S, S)))
         
-        # mask = (ar_q * ar_k * causal) + (nar_q * ar_k) + (nar_q * nar_k)
         mask = (ar_q.T @ ar_k * causal) + (nar_q.T @ ar_k) + (nar_q.T @ nar_k)
-        
-        # Convert to additive: 0 → attend, -inf → block
         attn_mask = mx.where(mask > 0, mx.array(0.0), mx.array(-1e9))
-        return attn_mask[None, :, :]  # [1, S, S]
+        return attn_mask[None, :, :]
 
     def __call__(self, *args, **kwargs):
         return self.forward_ar(*args, **kwargs)
