@@ -1,7 +1,6 @@
 """YuE2 AR–NAR Mixture-of-Transformers in MLX."""
 from __future__ import annotations
 from typing import Optional, Tuple, List, Dict, Any
-from pathlib import Path
 import json
 import math
 
@@ -34,7 +33,6 @@ class RotaryEmbedding(nn.Module):
 
 
 def _apply_rotary(x: mx.array, cos: mx.array, sin: mx.array) -> mx.array:
-    # x: [B, T, H, D], cos/sin: [B, T, half] -> [B, T, 1, half] for broadcast over heads
     cos = cos[:, :, None, :]
     sin = sin[:, :, None, :]
     half = x.shape[-1] // 2
@@ -69,7 +67,6 @@ class Attention(nn.Module):
         q = _apply_rotary(q, cos, sin)
         k = _apply_rotary(k, cos, sin)
 
-        # Transpose to [B, H, T, D] for attention computation
         q = q.transpose(0, 2, 1, 3)
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
@@ -95,13 +92,8 @@ class Attention(nn.Module):
             attn = attn + mask
         attn = mx.softmax(attn, axis=-1)
         out = attn @ v
-        # out: [B, H, T_q, D] where T_q is query tokens
-        # For decode with cache, we only want the output for the new tokens (last T positions)
         T_q = out.shape[2]
-        out = out[:, :, -T:, :]  # Keep only the last T tokens (the new ones)
-        out = out.transpose(0, 2, 1, 3)  # [B, T, H, D]
-        H, D = out.shape[2], out.shape[3]
-        out = out.reshape(B, T, -1)
+        out = out[:, :, -T:, :].transpose(0, 2, 1, 3).reshape(B, T, -1)
         return self.o_proj(out), new_cache
 
 
@@ -147,7 +139,6 @@ class DecoderLayer(nn.Module):
             mask_3d = ar_mask[:, :, None]
             ln_ar = self.input_layernorm(x)
             ln_nar = self.nar_input_layernorm(x)
-
             q_ar, k_ar, v_ar = self._project_qkv(self.self_attn, ln_ar, cos, sin)
             q_nar, k_nar, v_nar = self._project_qkv(self.nar_self_attn, ln_nar, cos, sin)
 
@@ -196,6 +187,24 @@ class DecoderLayer(nn.Module):
             return x, new_cache
 
 
+class TimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+        super().__init__()
+        self.frequency_embedding_size = frequency_embedding_size
+        layers = [nn.Linear(frequency_embedding_size, hidden_size),
+                  nn.Linear(hidden_size, hidden_size)]
+        self.mlp = layers
+
+    def __call__(self, t: mx.array) -> mx.array:
+        half = self.frequency_embedding_size // 2
+        freqs = mx.exp(-math.log(10000) * mx.arange(half, dtype=mx.float32) / half)
+        args = t[:, None] * freqs[None, :]
+        emb = mx.concatenate([mx.cos(args), mx.sin(args)], axis=-1)
+        x = self.mlp[0](emb)
+        x = nn.silu(x)
+        return self.mlp[1](x)
+
+
 class YuE2MLX(nn.Module):
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
@@ -207,6 +216,8 @@ class YuE2MLX(nn.Module):
         self.lm_head = nn.Linear(config["hidden_size"], config["vocab_size"], bias=False)
         self.llm2vae = nn.Linear(config["hidden_size"], config["latent_dim"])
         self.vae2llm = nn.Linear(config["latent_dim"], config["hidden_size"])
+        self.time_embed = TimestepEmbedder(config["hidden_size"])
+        # Latent position embedding (fixed, non-learnable)
         max_frames = config.get("max_latent_frames", 24576)
         pe = mx.zeros((max_frames, config["hidden_size"]))
         pos = mx.arange(max_frames, dtype=mx.float32)[:, None]
@@ -227,17 +238,9 @@ class YuE2MLX(nn.Module):
             is_causal = (input_ids.shape[1] == 1) and i == 0
             x, new_cache = layer(x, cos, sin, ar_mask, caches[i], attention_mask, is_causal)
             new_caches.append(new_cache)
-        return self.norm(x), new_caches
+        x = self.norm(x)
+        logits = self.lm_head(x)
+        return logits, new_caches
 
     def __call__(self, *args, **kwargs):
         return self.forward_ar(*args, **kwargs)
-
-    @staticmethod
-    def from_pretrained(path: str) -> 'YuE2MLX':
-        path = Path(path)
-        with open(path / "config.json") as f:
-            config = json.load(f)
-        model = YuE2MLX(config)
-        weights = mx.load(str(path / "weights.npz"))
-        model.load_weights(weights, strict=False)
-        return model
